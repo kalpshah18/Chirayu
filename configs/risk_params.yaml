@@ -1,0 +1,59 @@
+# Risk and pricing engine parameters. See IMPLEMENTATION PLAN.md §6.8.
+
+discounting:
+  annual_yield: 0.12          # assumption: GIFT IFSC USD lease discount rate
+  term_months_options: [24, 36]
+
+rental_index:
+  # 2-state Markov-switching log rental index with launch jumps (new-GPU-generation shocks).
+  regimes:
+    normal:
+      drift_annual: -0.10     # assumption: secular rental price decay as supply grows
+      vol_annual: 0.15
+    launch_shock:
+      drift_annual: -0.35     # assumption: sharp repricing after a new GPU generation launches
+      vol_annual: 0.35
+  transition:
+    p_stay_normal: 0.95
+    p_stay_shock: 0.70
+  jump_intensity_per_year: 1.0  # assumption: roughly one generation launch per year
+
+failure:
+  # p_f(g) derived from wear/gsu.py hazard, anchored to configs/wear_params.yaml baseline_hazard_anchors.
+  salvage_fraction_S:
+    value: 0.10
+    source: "assumption: scrap/component salvage value as a fraction of original cost"
+
+monte_carlo:
+  n_leases: 500
+  n_paths: 20000
+  seed: 20261122
+  convergence_tolerance: 0.02   # EL must agree within +/-2% between 20k and 100k paths
+
+tranching:
+  target_exceedance_probabilities:
+    senior: 0.01
+    mezzanine: 0.05
+  note: "Target exceedance probabilities are illustrative; §13 asks mentors what a GIFT banker would find credible."
+
+hedge:
+  instrument: "CME/Silicon Data H100 Rental Index Futures OR ICE/Ornn OCPI"
+  note: "Preliminary: basis estimated from sparse public US index points; report a bootstrap confidence interval."
+
+insurance:
+  loading_theta: 0.20   # assumption: insurer margin over expected residual shortfall
+
+lessee_optimizer:
+  energy_cost_per_kwh_inr: 8.0   # assumption: GIFT City commercial tariff
+  value_per_unit_throughput: 1.0  # normalised; see risk/optimizer.py docstring
+  power_cap_grid_frac_tdp: [0.6, 0.7, 0.8, 0.9, 1.0]
+  source_for_power_temp_curve: "Zhao et al., arXiv 2402.18593 (MIT Supercloud V100 power-capping study)"
+
+book:
+  n_leases: 500
+  n_lessees: 3
+  sku_mix:
+    H100: 0.7
+    B200: 0.3
+  term_months_options: [24, 36]
+  seed: 20261122

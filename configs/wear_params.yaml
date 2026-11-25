@@ -1,0 +1,91 @@
+# GPU Stress Unit (GSU) parameters.
+# Every value below is either taken from a cited published result or explicitly
+# labelled "assumption" with a defensible range. See IMPLEMENTATION PLAN.md §2.2 and §6.6.
+# 1 GSU = 1 hour at reference conditions: T_ref, P_ref, no cycling.
+
+reference:
+  T_ref_c: 70.0          # assumption: typical sustained training temperature
+  P_ref_frac_tdp: 0.70   # assumption: reference load as a fraction of TDP
+
+time_at_temperature_power:
+  # Arrhenius-type acceleration: exp[(Ea/k) * (1/T_ref - 1/T_j)]
+  # Two regimes, because Summit (liquid-cooled, <60C) showed a weak temperature
+  # effect on failures while Titan (air-cooled) showed a strong one.
+  # Source: Shin et al. SC21 (Summit); Ostrouchov et al. SC20 (Titan).
+  activation_energy_ev:
+    cool_regime:         # below ~60 C, liquid-cooled-like operation
+      value: 0.30
+      range: [0.20, 0.45]
+      source: "assumption, calibrated against calibrate_summit.ipynb coefficient (expected weak/non-significant)"
+    hot_regime:           # above ~60 C, air-cooled-like operation
+      value: 0.60
+      range: [0.45, 0.90]
+      source: "assumption, calibrated against calibrate_titan.ipynb position-hazard coefficient"
+    regime_boundary_c: 60.0
+    source_for_boundary: "Shin et al. SC21: most Summit GPUs stayed below 60C at peak; highest temp at a double-bit error was 46.1C"
+  boltzmann_ev_per_k: 8.617333262e-5
+  power_exponent_n:
+    value: 1.5
+    range: [1.0, 2.5]
+    source: "assumption — higher sustained power increases junction temperature gradient and current density stress"
+
+thermal_cycling:
+  # w_c * sum_cycles (delta_T_i / delta_T_ref)^m, rainflow-counted
+  delta_T_ref_c: 20.0
+  weight_w_c:
+    value: 0.02
+    range: [0.005, 0.05]
+    source: "assumption"
+  exponent_m:
+    value: 2.0
+    range: [1.5, 3.0]
+    source: "assumption — Coffin-Manson-style exponent for thermomechanical fatigue"
+
+memory_error_growth:
+  # w_m * delta(remapped rows), where logged
+  weight_w_m:
+    value: 0.01
+    range: [0.002, 0.05]
+    source: "assumption, scaled so the H100 vs A100 MTBE ratio below is respected"
+  h100_vs_a100_mtbe_ratio:
+    value: 3.2
+    source: "Cui et al., arXiv 2503.11901 (NCSA Delta): H100 has 3.2x lower per-GPU MTBE than A100 for uncorrectable ECC errors"
+  row_remap_mitigation_frac:
+    value: 0.92
+    source: "Cui et al., arXiv 2503.11901: row remapping mitigated 92% of uncorrectable ECC errors on H100"
+
+residual_value_condition_factor:
+  # C(g) = exp(-lambda * g), g in cumulative GSU
+  lambda_h100:
+    value: null   # fit in wear/sensitivity.py / calibrate_* notebooks from the haircut points below
+    calibration_points:
+      - hours: 20000
+        haircut_frac_low: 0.15
+        haircut_frac_high: 0.25
+        source: "reseller buyback guidance cited in IMPLEMENTATION PLAN.md §2.2"
+    source_for_existence: "Silicon Data H100 market analysis: condition is a first-order driver of resale value"
+
+baseline_hazard_anchors:
+  # The wear engine shifts a baseline hazard; it does not invent an absolute H100 failure rate.
+  meta_rsc1_failures_per_1000_node_days:
+    value: 6.50
+    source: "Kokolis et al., HPCA 2025 (arXiv 2410.21680)"
+  meta_rsc2_failures_per_1000_node_days:
+    value: 2.34
+    source: "Kokolis et al., HPCA 2025 (arXiv 2410.21680)"
+  meta_rsc1_vs_rsc2_gpu_swap_rate_ratio:
+    value: 3.0
+    source: "Kokolis et al., HPCA 2025 — authors suggest heavier workloads may explain the difference"
+  llama3_interruptions:
+    count: 419
+    window_days: 54
+    fleet_h100_count: 16384
+    faulty_gpu_count: 148
+    faulty_hbm3_count: 72
+    source: "Meta Llama 3 training report, via Tom's Hardware coverage — upper bound on H100 interruption rate, counts interruptions not card replacements"
+
+sensitivity:
+  # wear/sensitivity.py sweeps every "range" above.
+  # Claim defended: steady vs bursty archetype ranking is stable across >= 95% of the swept space.
+  n_samples: 2000
+  target_rank_stability: 0.95

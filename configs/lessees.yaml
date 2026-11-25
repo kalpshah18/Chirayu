@@ -1,0 +1,36 @@
+# Lessee archetypes used by risk/book.py.
+# gsu_per_hour_* is filled in by wear/profiles.ipynb from MIT Supercloud job clusters
+# (see IMPLEMENTATION PLAN.md §6.6). Until that notebook has run on the real extract,
+# these are placeholder distributions drawn from the same shape the clustering is
+# expected to produce (steady jobs run cooler and less bursty than short jobs).
+
+archetypes:
+  steady_training:
+    description: "Long, steady large-model training runs: high mean utilization, low burstiness."
+    source: "MIT Supercloud labelled job cluster, dominant job type to be named after profiles.ipynb runs"
+    gsu_per_hour_mean: 0.85
+    gsu_per_hour_std: 0.10
+  bursty_experimentation:
+    description: "Short, bursty interactive/experimentation jobs: high cycling, higher peak temperature variance."
+    source: "MIT Supercloud labelled job cluster"
+    gsu_per_hour_mean: 1.25
+    gsu_per_hour_std: 0.30
+  inference_serving:
+    description: "Inference serving: moderate, flat utilization with occasional load spikes."
+    source: "MIT Supercloud labelled job cluster"
+    gsu_per_hour_mean: 0.70
+    gsu_per_hour_std: 0.08
+
+lessees:
+  lessee_a:
+    name: "Indian AI cloud — training-heavy"
+    archetype: steady_training
+    n_gpus: 220
+  lessee_b:
+    name: "Indian AI cloud — research/experimentation"
+    archetype: bursty_experimentation
+    n_gpus: 150
+  lessee_c:
+    name: "Indian AI cloud — inference-as-a-service"
+    archetype: inference_serving
+    n_gpus: 130

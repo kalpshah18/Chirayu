@@ -1,0 +1,22 @@
+name: Daily market scrape
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # daily, 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -e .
+      - name: Scrape providers and commit snapshot
+        run: |
+          echo "market/scrapers/ providers are not yet wired in (see IMPLEMENTATION PLAN.md §6.7)."
+          echo "Once implemented, this step should call each provider, normalize via market/normalize.py,"
+          echo "and append via market/store.py, then commit the resulting Parquet file."

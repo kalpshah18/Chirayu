@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Large data stays out of git; data/README.md records what was fetched and how to reproduce it.
+data/raw/
+data/reduced/
+*.parquet
+!data/**/sample_*.parquet
+
+# Keys are generated locally, never committed.
+*.key
+secrets/
+
+.DS_Store
