@@ -2,7 +2,16 @@
 
 **Chirayu** (चिरायु, "long-lived") is a pricing, risk and financing desk for GPU operating leases written out of GIFT IFSC. It prices leases, marks every leased GPU each month, simulates lease-end losses, hedges market risk and sizes funding tranches. All of this rests on per-GPU condition data that the lessee cannot quietly edit.
 
-This document is the build plan for the GIFT FutureLab Grand Challenge 2026–27 finale (22 Dec 2026, IIT Gandhinagar). It covers what we build, how each part works, who builds it, and in what order.
+This document is the build plan for the GIFT FutureLab Grand Challenge 2026–27 finale (22 Dec 2026, IIT Gandhinagar).
+
+> **Constraint: we have no GPU access.** The plan is built entirely on public datacenter telemetry and published research results. The good news is that it ends up stronger than a single-GPU demo would have been.
+>
+> - We validate tamper detection on **thousands of real Summit supercomputer nodes**, which carry an independent power-supply reading next to every GPU's self-reported power. That is our "witness" channel, already measured.
+> - We build **lessee workload profiles** from real deep-learning job traces (MIT Supercloud).
+> - We calibrate **wear and failure** on two real fleets with opposite cooling regimes (Titan, air-cooled; Summit, liquid-cooled).
+> - We anchor **modern H100/A100 failure rates** to published results from NCSA Delta, Meta's research clusters and the Llama 3 training report.
+>
+> The meter agent is still built as deployable code, but it is tested against replayed telemetry instead of a live GPU. It runs on a real GPU at the pilot stage.
 
 ---
 
@@ -11,11 +20,11 @@ This document is the build plan for the GIFT FutureLab Grand Challenge 2026–27
 | Date | Event | What must exist |
 | --- | --- | --- |
 | 25 Nov 2026 | First shortlist | Application submitted |
-| 30 Nov 2026 | First mentoring interaction | M0 done: meter v0 on a real GPU, GSU v0, rate card v0, open questions list (§12) |
-| 4 Dec 2026 | Final shortlist | M1 in progress: ledger, witness prototype, Monte Carlo v1 |
+| 30 Nov 2026 | First mentoring interaction | M0 done: data downloaded and profiled, replay harness, GSU v0 on real traces, rate card v0, mentor questions (§13) |
+| 4 Dec 2026 | Final shortlist | M1 in progress: ledger + tamper detection on Summit data, Monte Carlo v1 |
 | 19 Dec 2026 | Feature freeze | M3 done; only bug fixes after this |
-| 20–21 Dec 2026 | Rehearsals | Two timed full runs; backup video of every live moment |
-| 22 Dec 2026 | Grand Finale | Four live demo moments (§10) |
+| 20–21 Dec 2026 | Rehearsals | Two timed full runs; backup video of every demo moment |
+| 22 Dec 2026 | Grand Finale | Four demo moments (§11) |
 
 ---
 
@@ -23,485 +32,522 @@ This document is the build plan for the GIFT FutureLab Grand Challenge 2026–27
 
 ### 1.1 Finale deliverables
 
-1. **Risk desk dashboard**, covering a synthetic book of 500 GPU leases across three Indian AI-cloud lessees. It shows marks, LTV, expected loss, tail loss, tranche sizing and hedge ratio.
-2. **Live lease pricer:** the same GPU-hours run under two operating profiles give two different rents. A flat worst-case lease is shown beside them for comparison.
+1. **Risk desk dashboard**, covering a book of 500 GPU leases across three Indian AI-cloud lessees. Each lessee's operating profile is built from real job traces. It shows marks, LTV, expected loss, tail loss, tranche sizing and hedge ratio.
+2. **Live lease pricer:** the same GPU-hours under two real workload profiles give two different rents. A flat worst-case lease is shown beside them.
 3. **Value-of-data analysis:** senior tranche size and funding saving (bps) with versus without condition data.
-4. **Trust layer on a real GPU:**
-   - a signed, hash-chained telemetry stream;
-   - an independent power witness;
-   - a live tamper detection: spoof the agent, the alert fires and the mark updates.
-5. **Wear model** (GPU Stress Unit, GSU) with documented parameters, sensitivity bands and a calibration notebook on the ORNL Titan GPU-lifetime dataset.
+4. **Trust layer validated on real fleet data:**
+   - signed, hash-chained telemetry through the ledger;
+   - tamper detection evaluated on real Summit nodes, with detection rate, false alarms per node-day and detection delay;
+   - a live replay where we inject a spoof and watch the alert fire.
+5. **Wear model** (GPU Stress Unit, GSU) with parameters taken from published results and calibrated on two public fleet datasets, reported with sensitivity bands.
 6. **Market data pipeline:** daily scrape of public GPU rental prices, forming an India rental curve and its basis against public US index points.
 
 ### 1.2 Non-goals for the finale
 
-- Real lessor data or real leases. The book is synthetic, and we say so.
-- Production security hardening: HSMs, key rotation, multi-tenant auth.
-- Remote kill switches or any control over the GPU. Chirayu is read-only.
-- Retail investment advice of any kind.
-- A regulatory filing. We only identify the likely route (IFSCA TechFin / Ancillary Services) and ask mentors.
+- Running the meter on a live datacenter GPU. That happens at the pilot.
+- Real lessor data or real leases. The book is generated, but its profiles come from real traces, and we say so.
+- Hardware attestation on confidential-computing GPUs. It is designed and documented, not demonstrated.
+- Production security hardening, remote control of GPUs, retail investment advice, regulatory filings.
 
 ---
 
-## 2. Architecture
+## 2. Data and evidence base
+
+### 2.1 Public datasets we use
+
+| Dataset | What it contains | What we use it for | Access |
+| --- | --- | --- | --- |
+| **OLCF Summit power and thermal data** (Shin et al., SC21; DOI 10.13139/OLCF/1861393) | 27,756 V100 GPUs. Per-component power and temperature, originally 1 Hz, released as 10 s and 1 min aggregates over five month-long segments. Node input power from the power supplies. XID error log | **Witness validation:** node PSU input power is an independent channel next to self-reported GPU power. **Failure modelling** with real temperature covariates | Globus via the DOI page; companion code at `github.com/at-aaims/summit_power_and_thermal_data` |
+| **ClusterWise** (Summit-derived, Hugging Face, CC BY 4.0) | 36 fields: GPU core and HBM temperature for 6 GPUs per node, per-GPU power, CPU power, PSU input power, XID code and a failure label, job IDs; 240 GB Parquet | Same as above, in an easier format: stream only the columns and nodes we need | `load_dataset("MachaParfait/ClusterWise", streaming=True)` or Polars over selected Parquet files |
+| **MIT Supercloud dataset** (Samsi et al., HPEC 2021) | V100 GPU time series at 100 ms (utilization, memory, temperature, power) for many jobs, including a labelled subset of 3,430 deep-learning jobs | **Lessee profiles:** real training and inference behaviour turned into wear distributions | `aws s3 cp s3://mit-supercloud-dataset/datacenter-challenge/202201/ … --no-sign-request` (labelled subset first) |
+| **ORNL Titan GPU lifetimes** (Ostrouchov et al., SC20; DOI 10.13139/ORNLNCCS/1657202) | About 100,000 GPU-years of K20X lifetimes with serials, cabinet positions and failure types | **Hot-regime calibration:** failure hazard vs. position, which the authors tie to heat dissipation | `github.com/olcf/TitanGPULife` |
+
+### 2.2 Results we take directly from papers
+
+These are used as anchors, not re-derived. Every one appears with its citation on the slide or in the notebook that uses it.
+
+| Result | Source | Where it enters the model |
+| --- | --- | --- |
+| Titan GPU failure hazard strongly correlated with heat dissipation (cooling-air path and position) and with job scheduling | Ostrouchov et al., SC20 | Temperature acceleration in the **hot / air-cooled** regime |
+| Summit (liquid-cooled): most GPUs stayed below 60 °C at peak, and overheating was not a significant driver of most failures. The highest temperature seen at a double-bit error was 46.1 °C. On Titan, high temperature was a major factor | Shin et al., SC21 | **Regime dependence:** thermal wear matters where GPUs run hot. This is exactly why it must be measured per lease and not assumed |
+| Summit: GPU core temperature rose near-linearly with GPU power in a 4,608-node job; spread ~62 W power, ~15.8 °C temperature | Shin et al., SC21 | **Thermal consistency check** in the tamper detector |
+| Summit per-node power sums differ from switchboard meters by ~11% on average but oscillate in phase | Shin et al., SC21 | Witness calibration uses a fitted offset and gain, not raw equality |
+| NCSA Delta: H100 has 3.2× lower per-GPU MTBE than A100 for uncorrectable ECC memory errors; recovery mechanisms such as row remapping mitigated 92% of uncorrectable ECC errors on H100 | Cui et al., arXiv 2503.11901 | **Memory-error term** of the GSU; H100 vs. A100 baseline hazard |
+| Meta RSC-1 vs. RSC-2 (A100): 6.50 vs. 2.34 failures per 1,000 node-days. RSC-1 GPUs swapped at ~3× the rate; the authors suggest heavier workloads may be the cause | Kokolis et al., HPCA 2025 | **Workload dependence** of failure/swap rates (stated as the authors' hypothesis); baseline node failure rate |
+| Llama 3 pre-training snapshot: 419 unexpected interruptions in 54 days on 16,384 H100s, of which 148 faulty GPU and 72 HBM3 | Meta Llama 3 report (via press coverage) | Upper bound on H100 annualized interruption rate. The source counts interruptions, not card replacements |
+| H100 resale value depends on condition as a first-order driver | Silicon Data H100 market analysis | Condition factor C(g) exists and is material |
+| Resellers apply a 15–25% haircut for an H100 with ~20k hours | Reseller buyback guidance | Calibrating λ in C(g) = e^(−λg) |
+
+---
+
+## 3. Architecture
 
 ```mermaid
 flowchart LR
-  subgraph DC["Lessee data centre"]
-    A["GPU + meter agent<br/>NVML telemetry, signed,<br/>bound to device identity"]
-    W["Power witness<br/>lessor-owned, sealed,<br/>signs PDU power"]
+  subgraph SRC["Telemetry source"]
+    direction TB
+    RP["Replay harness<br/>Summit / MIT Supercloud traces"]
+    NV["NVML backend<br/>(pilot stage, real GPU)"]
   end
-  A -->|signed batches| L["Ledger<br/>verify signatures + chain,<br/>cross-check power"]
-  W -->|signed readings| L
-  L --> G["Wear engine<br/>GSU per serial"]
-  MD["Market data pipeline<br/>rental + resale prices"] --> R
+  RP --> A["Meter agent<br/>canonical records,<br/>hash chain, signatures"]
+  NV -.-> A
+  WS["Witness channel<br/>Summit PSU input power<br/>(physical meter at pilot)"] --> L
+  A -->|signed batches| L["Ledger<br/>verify, chain, gaps,<br/>divergence + thermal checks"]
+  ATK["Attack injector<br/>spoof, replay, delete, swap"] -.-> A
+  L --> G["Wear engine<br/>GSU per device"]
+  MD["Market data pipeline"] --> R
+  PAP["Published results<br/>(§2.2)"] --> G
   G --> R["Risk & pricing engine<br/>value = market × condition"]
-  R --> D["Risk desk dashboard<br/>rate card, marks, LTV, loss,<br/>tranches, hedge"]
-  R --> X["Exports<br/>condition reports,<br/>IFSCA equipment record"]
+  R --> D["Risk desk dashboard"]
+  R --> X["Exports: condition reports,<br/>equipment record"]
 ```
 
-**Data flow in one sentence:** every second the agent and the witness each sign a reading. The ledger verifies them and flags divergence. The wear engine turns verified readings into stress units per GPU per month. The risk engine combines stress units with market data to produce every financial number on the dashboard.
+**Data flow.** The replay harness feeds real telemetry rows to the meter agent exactly as NVML would. The agent signs them. The witness channel carries the same node's independently measured PSU power. The ledger verifies both and runs the detectors. The wear engine produces stress units per device. The risk engine turns stress units and market data into every financial number.
 
 ---
 
-## 3. Repository layout
+## 4. Repository layout
 
 ```
 chirayu/
 ├── IMPLEMENTATION PLAN.md
 ├── README.md
-├── pyproject.toml              # uv / pip, Python 3.11+
+├── pyproject.toml              # Python 3.11+
 ├── configs/
-│   ├── wear_params.yaml        # Ea, n, m, weights, reference conditions, ranges
-│   ├── risk_params.yaml        # yields, rho, regime model, tranche targets
-│   └── lessees.yaml            # synthetic lessee profiles
-├── agent/                      # meter agent (runs on the GPU host)
-│   ├── sampler.py              # NVML sampling loop
-│   ├── chain.py                # hash chain + ed25519 signing
-│   ├── attest.py               # NVIDIA attestation binding (optional)
-│   ├── uploader.py             # batching, offline buffer, retry
-│   └── spoof.py                # demo-only: tampered agent for the live catch
+│   ├── wear_params.yaml        # parameters + ranges + source citation per parameter
+│   ├── risk_params.yaml
+│   └── lessees.yaml            # lessee archetypes → MIT Supercloud job clusters
+├── data/
+│   ├── fetch_summit.py         # selected nodes/columns from ClusterWise or OLCF
+│   ├── fetch_supercloud.py     # labelled subset from S3
+│   ├── fetch_titan.py
+│   └── README.md               # licences, citations, what we downloaded
+├── agent/
+│   ├── backends/
+│   │   ├── nvml.py             # real NVML (pilot)
+│   │   └── replay.py           # dataset rows exposed through the same interface
+│   ├── sampler.py
+│   ├── chain.py                # canonical JSON, hash chain, ed25519
+│   ├── attest.py               # design + stub; real binding at pilot
+│   └── uploader.py
 ├── witness/
-│   ├── firmware/               # ESP32 (PlatformIO) firmware
-│   ├── bridge/                 # Pi/laptop bridge for smart-plug fallback
-│   └── HARDWARE.md             # BOM, wiring, safety
-├── ledger/                     # FastAPI service + Postgres
-│   ├── app.py
-│   ├── models.py               # SQLAlchemy tables
-│   ├── verify.py               # signature, chain, nonce checks
-│   ├── divergence.py           # witness cross-check (regression + CUSUM)
-│   └── merkle.py               # hourly Merkle roots
+│   ├── replay_witness.py       # Summit PSU input power as signed witness stream
+│   └── HARDWARE.md             # physical witness design for the pilot
+├── attacks/
+│   └── inject.py               # spoof power/temp, delete, replay, swap identity
+├── ledger/
+│   ├── app.py                  # FastAPI
+│   ├── models.py
+│   ├── verify.py
+│   ├── divergence.py           # PSU-vs-reported regression + CUSUM
+│   ├── thermal.py              # power→temperature consistency model
+│   └── merkle.py
+├── eval/
+│   └── tamper_eval.py          # ROC, false alarms per node-day, detection delay
 ├── wear/
-│   ├── gsu.py                  # GSU computation
-│   ├── rainflow_cycles.py      # thermal cycle extraction
-│   ├── calibrate_titan.ipynb   # Cox model on ORNL Titan data
+│   ├── gsu.py
+│   ├── rainflow_cycles.py
+│   ├── profiles.ipynb          # MIT Supercloud → lessee archetypes
+│   ├── calibrate_summit.ipynb  # Cox model with real temperature covariates
+│   ├── calibrate_titan.ipynb   # hot-regime hazard vs position
 │   └── sensitivity.py
 ├── market/
-│   ├── scrapers/               # one module per provider
-│   ├── normalize.py            # USD/GPU-hr, SKU, term
-│   ├── index.py                # India rental curve + basis
-│   └── store.py                # DuckDB / Parquet
+│   ├── scrapers/
+│   ├── normalize.py
+│   ├── index.py
+│   └── store.py
 ├── risk/
-│   ├── residual.py             # M(a,s), C(g), p_f(g)
-│   ├── pricing.py              # base rent solve, indexed variant
-│   ├── reserves.py             # wear reserve rate
-│   ├── montecarlo.py           # portfolio loss simulation
-│   ├── tranching.py            # attachment points, value of data
-│   ├── hedge.py                # min-variance hedge ratio, basis
-│   ├── insurance.py            # RV insurance premium
-│   ├── optimizer.py            # lessee power-cap optimizer
-│   └── book.py                 # synthetic lease book generator
-├── api/                        # FastAPI read API for the dashboard
+│   ├── residual.py
+│   ├── pricing.py
+│   ├── reserves.py
+│   ├── montecarlo.py
+│   ├── tranching.py
+│   ├── hedge.py
+│   ├── insurance.py
+│   ├── optimizer.py            # power-cap trade-off from published/measured curves
+│   └── book.py
+├── api/
 ├── web/                        # React + Vite dashboard
-├── notebooks/                  # exploration, figures for slides
+├── notebooks/
 ├── tests/
 └── .github/workflows/
-    ├── ci.yml                  # lint + tests
-    └── scrape.yml              # daily market scrape (cron)
+    ├── ci.yml
+    └── scrape.yml
 ```
 
 ---
 
-## 4. Tech stack
+## 5. Tech stack and compute
 
-| Layer | Choice | Why |
-| --- | --- | --- |
-| Language | Python 3.11+ for everything except firmware and web | One language across agent, ledger, models |
-| GPU telemetry | `nvidia-ml-py` (pynvml); DCGM optional | Direct NVML access, no daemon needed |
-| Crypto | `pynacl` (Ed25519), SHA-256 | Small, well-reviewed, fast |
-| Attestation | NVIDIA Attestation SDK / nvTrust on a confidential-computing-capable H100 | Binds logs to a device identity; optional, with a documented fallback |
-| Ledger | FastAPI + SQLAlchemy + Postgres (SQLite in dev) | Fast to build, typed |
-| Wear model | NumPy, `rainflow`, `lifelines` (Cox PH) | Standard reliability tooling |
-| Risk engine | NumPy (vectorised), SciPy (`brentq`, stats); JAX only if speed requires | Monte Carlo on a laptop |
-| Market data | `httpx`, `selectolax`/BeautifulSoup, DuckDB + Parquet | Cheap, queryable, versionable |
-| Dashboard | React + Vite + TypeScript, Recharts or Plotly | Fast iteration, good charts |
-| Firmware | ESP32-S3, PlatformIO (Arduino or ESP-IDF), PZEM-004T v3 | Cheap, documented, UART metering |
-| CI | GitHub Actions | Tests on push; daily scrape cron |
+| Layer | Choice |
+| --- | --- |
+| Language | Python 3.11+ (agent, ledger, models); TypeScript (dashboard) |
+| Data | Polars + DuckDB over Parquet; Hugging Face `datasets` in streaming mode |
+| Crypto | `pynacl` (Ed25519), SHA-256 |
+| Ledger | FastAPI + SQLAlchemy; SQLite for development, Postgres for the demo |
+| Wear and statistics | NumPy, SciPy, `rainflow`, `lifelines` (Cox PH), `scikit-learn` (clustering profiles, ROC) |
+| Risk engine | NumPy (vectorised Monte Carlo); JAX only if needed |
+| Market data | `httpx`, `selectolax`, DuckDB |
+| Dashboard | React + Vite + Recharts/Plotly |
+| CI | GitHub Actions (tests on push; daily scrape cron) |
+
+**Compute: no GPU needed.**
+
+- Everything runs on laptops.
+- For the large datasets, use a free Kaggle or Colab CPU session, or the IITGN CPU cluster, to stream and filter. Keep only the reduced Parquet extracts in the repo or on a shared drive: target < 5 GB total.
+  - **Summit:** 200–500 nodes × 1 month at 10 s, chosen at random and stratified by cabinet.
+  - **MIT Supercloud:** the labelled subset first, more if time allows.
 
 ---
 
-## 5. Components
+## 6. Components
 
-Each component lists its purpose, interfaces, design and acceptance criteria. "Owner A" means the data and trust layer; "Owner B" means the financial model. Assign names at kickoff.
+"Owner A" means the data and trust layer; "Owner B" means the financial model. Assign names at kickoff.
 
-### 5.1 Meter agent (`agent/`, Owner A)
+### 6.1 Data fetch and profiling (`data/`, Owner A, M0)
 
-**Purpose.** Produce a signed, gap-evident, per-second record of each GPU's thermal, electrical and error state, tied to that GPU's identity.
+- **Summit / ClusterWise.** Stream these columns: `timestamp, hostname, gpu{0..5}_core_temp, gpu{0..5}_mem_temp, p{0,1}_gpu{0..2}_power, p{0,1}_power, ps{0,1}_input_power, xid, label, allocation_id`. Sample nodes at random, stratified by cabinet (hostname encodes position). Write one Parquet file per node per month. Record the exact files and row counts in `data/README.md`.
+- **MIT Supercloud.** Download the labelled GPU subset, then resample the 100 ms series to 1 s (mean for power and utilization, max for temperature).
+- **Titan.** Clone `olcf/TitanGPULife` and use its cleaned per-GPU summary file.
+- **Profiling notebook** for each dataset: missingness, sampling gaps, value ranges, and the known caveats from §2.2 (for example, missing Summit temperature periods in spring/early summer 2020).
 
-**Sampling (1 Hz per GPU).**
+**Acceptance.** Reduced datasets are reproducible from scripts in a single command. A data card lists each dataset's licence and citation.
 
-| Field | NVML source | Unit |
-| --- | --- | --- |
-| `t` | host monotonic clock + wall clock | ns / ISO-8601 |
-| `gpu_uuid`, `serial` | `nvmlDeviceGetUUID`, `nvmlDeviceGetSerial` | — |
-| `temp_core` | `nvmlDeviceGetTemperature(NVML_TEMPERATURE_GPU)` | °C |
-| `temp_mem` | `nvmlDeviceGetFieldValues(NVML_FI_DEV_MEMORY_TEMP)` (where supported) | °C |
-| `power` | `nvmlDeviceGetPowerUsage` | mW |
-| `energy` | `nvmlDeviceGetTotalEnergyConsumption` | mJ (cumulative) |
-| `clk_sm`, `clk_mem` | `nvmlDeviceGetClockInfo` | MHz |
-| `util_gpu`, `util_mem` | `nvmlDeviceGetUtilizationRates` | % |
-| `throttle` | `nvmlDeviceGetCurrentClocksEventReasons` (older: `...ThrottleReasons`) | bitmask |
-| `ecc_sbe`, `ecc_dbe` | `nvmlDeviceGetTotalEccErrors` (corrected / uncorrected, aggregate) | count |
-| `remap_*` | `nvmlDeviceGetRemappedRows` (Ampere+) | counts + pending/failure flags |
-| `nvlink_crc` | `nvmlDeviceGetFieldValues` NVLink CRC error counters | count |
-| `xid` | `nvmlDeviceRegisterEvents` + `nvmlEventSetWait` (critical XID events) | event list |
+### 6.2 Meter agent (`agent/`, Owner A)
 
-Field availability varies by GPU and driver. The sampler must record `null` for unsupported fields, never `0`.
+**Purpose.** Produce a signed, gap-evident, per-second record of each GPU's thermal, electrical and error state. In the finale it is fed by `ReplayBackend`; at the pilot by `NvmlBackend`. Both implement the same interface:
 
-**Record and chain.**
+```python
+class TelemetryBackend(Protocol):
+    def devices(self) -> list[DeviceInfo]: ...        # uuid/serial (replay: hostname+slot)
+    def sample(self, dev: DeviceInfo) -> Sample: ...  # temp_core, temp_mem, power, energy, ecc, xid, ...
+```
+
+- **`ReplayBackend`** walks a Summit or Supercloud Parquet file at the original cadence, or accelerated (e.g. 60× for the demo). Fields the dataset lacks are `null`, never `0`.
+- **`NvmlBackend`** maps to `nvmlDeviceGetTemperature`, `nvmlDeviceGetPowerUsage`, `nvmlDeviceGetTotalEnergyConsumption`, `nvmlDeviceGetTotalEccErrors`, `nvmlDeviceGetRemappedRows`, `nvmlDeviceGetFieldValues` (HBM temperature, NVLink CRC) and XID events. It is unit-tested with a mocked `pynvml`.
+
+**Record and chain** (canonical JSON, Ed25519 over everything except `sig`):
 
 ```json
 {
   "v": 1,
-  "device": {"uuid": "GPU-…", "serial": "…", "attest_ref": "sha256:…|null"},
+  "device": {"id": "summit:a01n03:gpu2", "attest_ref": null},
   "seq": 184223,
-  "t_wall": "2026-12-10T09:31:07.000Z",
-  "t_mono_ns": 912384719283,
+  "t": "2020-08-14T09:31:10Z",
   "nonce": "ledger-issued, rotates every 60 s",
-  "s": { "temp_core": 71, "temp_mem": 78, "power": 612400, "energy": 1.83e10, "...": "..." },
-  "prev": "sha256 of previous record",
-  "sig": "ed25519 over canonical JSON of all fields except sig"
+  "s": {"temp_core": 41.0, "temp_mem": 44.0, "power_w": 212.4, "xid": null},
+  "prev": "sha256(prev record)",
+  "sig": "ed25519(...)"
 }
 ```
 
-- **Canonical JSON:** sorted keys, no whitespace, floats rounded to fixed precision. Signatures must be reproducible on the ledger side.
-- **Batching:** upload every 10 s. Buffer to a local SQLite file when offline, so gaps are filled later rather than lost. Missing `seq` values are visible to the ledger.
-- **Nonces:** the ledger issues a nonce every 60 s. Each record carries the current nonce, so pre-computed or replayed logs fail verification.
+Records are batched every 10 s and buffered locally when offline. Ledger nonces prevent pre-computed or replayed logs.
 
-**Identity binding (`attest.py`).**
+**Attestation (`attest.py`).** Document the pilot design: bind the agent key to an NVIDIA attestation report on confidential-computing-capable H100s. Ship it as a stub with tests of the binding logic. Say plainly on the slide that it is not demonstrated.
 
-- **Preferred:** on a confidential-computing-capable H100 (e.g. a cloud CC VM), request an attestation report from the NVIDIA Attestation SDK with the ledger nonce. The agent's Ed25519 public key goes into the report's user-data/nonce field. Store the report hash as `attest_ref`. A different physical GPU produces a different device certificate, which breaks the binding.
-- **Fallback (consumer or non-CC GPU):** bind to `uuid` + `serial` + VBIOS version, and state the limitation on the slide. The demo works either way. Only the strength of the swap-detection claim changes.
+**Acceptance.** Replaying 24 h of one Summit node produces a chain that verifies 100%. Each single-field edit, a deletion or a replayed batch is detected in tests. Throughput ≥ 10,000 records/s on a laptop, enough for accelerated demo replay.
 
-**Spoof mode (`spoof.py`, demo only).** Multiply reported power by 0.6 and subtract 10 °C from temperatures while the real load continues. This drives the live tamper catch (§10, moment 4).
+### 6.3 Witness channel (`witness/`, Owner A)
 
-**Acceptance.**
+**Finale: real data.** Summit's `ps0_input_power + ps1_input_power` is the node's AC input power, measured by the power supplies. The GPU and CPU power fields come from on-chip controllers (§2.2). The two are separate measurement paths, exactly the separation the physical witness provides at the pilot. `replay_witness.py` signs the PSU stream with its own witness key, so the ledger treats it as an independent source.
 
-- 1 Hz sampling for ≥ 8 h with < 0.1% missed samples on one GPU.
-- Agent overhead < 1% CPU of one core and no measurable GPU throughput loss.
-- The ledger verifies 100% of signatures and chain links on an untampered run.
-- Deleting one record, editing one value or replaying an old batch is each detected in tests.
+**Pilot: physical witness.** `HARDWARE.md` keeps the design: ESP32-S3 + PZEM-004T v3 + CT clamp in a sealed enclosure with a tamper switch, signing readings with its own key. It also lists the safety rule: CT clamp only on lab-checked wiring.
 
-### 5.2 Power witness (`witness/`, Owner A)
+**Optional stage prop (only if time allows, ~₹2–3k).** A metering smart plug under any laptop, with a small agent reading CPU package power (Linux RAPL). It shows the same divergence check physically on stage: "same protocol, different processor". This is a stretch goal, not on the critical path.
 
-**Purpose.** An independent, lessor-owned measurement of server power that the lessee's software cannot edit.
+### 6.4 Ledger and detectors (`ledger/`, Owner A)
 
-**Hardware (finale version).**
+Tables, endpoints, nonces, gap tracking and hourly Merkle roots are as in a standard append-only log:
 
-| Item | Purpose |
+- **Tables:** `devices`, `leases`, `telemetry`, `witness`, `gaps`, `alerts`, `merkle_roots`, `gsu_monthly`.
+- **Endpoints:** `POST /v1/nonce`, `POST /v1/telemetry/batch`, `POST /v1/witness/batch`, `GET /v1/devices/{id}/logbook`, `GET /v1/alerts`, `GET /v1/roots/{hour}`.
+
+**Detector 1: power divergence (`divergence.py`).**
+
+1. Per node, fit `P_psu(t) = α + β·(ΣP_gpu(t) + ΣP_cpu(t)) + ε(t)` on a clean calibration window of 24 h. α covers fans, memory, network and conversion loss; β ≥ 1 absorbs PSU efficiency.
+2. Online residual `e(t)`, normalised by the calibration σ. Run a two-sided CUSUM on the normalised residual, with threshold `h` chosen on held-out clean data for a target false-alarm rate.
+3. Optional refinement: a small gradient-boosted model of `P_psu` on lagged features, if the linear model's residuals are too wide.
+
+**Detector 2: thermal consistency (`thermal.py`).** Per GPU, fit a first-order model `T(t+Δ) = T(t) + (Δ/τ)·(T_amb + R·P(t) − T(t))` on clean data. The near-linear power→temperature relation reported for Summit (§2.2) is the justification. Faking power without matching temperature, or the reverse, shows as a residual.
+
+**Detector 3: integrity.** Chain breaks, gaps, nonce mismatch, identity change.
+
+**Alert types:** `POWER_DIVERGENCE`, `THERMAL_INCONSISTENT`, `CHAIN_BREAK`, `GAP`, `IDENTITY_CHANGE`, `WITNESS_SILENT`.
+
+### 6.5 Attack injection and evaluation (`attacks/`, `eval/`, Owner A)
+
+This is the strongest technical result in the project: tamper detection measured on real fleet data, not on one staged machine.
+
+**Attacks injected into replayed Summit streams:**
+
+| Attack | Injection |
 | --- | --- |
-| ESP32-S3 dev board | MCU, Wi-Fi, signing |
-| PZEM-004T v3.0 + 100 A split-core CT | Voltage, current, active power, energy over UART (Modbus-RTU) |
-| Enclosure + microswitch on the lid | Tamper flag: opening the box is signed into the stream |
-| RTC module or NTP | Timestamps independent of the lessee host |
+| Under-report load | Multiply reported GPU power by k ∈ {0.9, 0.8, 0.6} from a random start time |
+| Under-report heat | Subtract d ∈ {3, 5, 10} °C from reported core and HBM temperature |
+| Consistent fake | Scale power and adjust temperature through the fitted thermal model (the hardest case) |
+| Drop data | Delete random 10–60 min windows |
+| Replay | Re-send an earlier day's batch |
+| Swap | Change the device identity mid-stream, or splice in another node's trace |
 
-**Safety.** The PZEM's voltage input connects to mains. Use a CT clamp around one conductor of a pre-wired, lab-checked extension box, and never open live wiring. If lab support is not available in time, use the fallback.
+**Metrics, per attack and severity:**
 
-**Fallback (fast path for M1).** A metering smart plug with a local HTTP API (e.g. a Shelly Plus Plug S: `GET /rpc/Switch.GetStatus?id=0` returns `apower`), polled at 1 Hz by `witness/bridge/`. The bridge runs on a Raspberry Pi or a second laptop and signs each reading. This is weaker, because the trust anchor is the bridge rather than sealed hardware. State that in the demo.
+- detection rate within 1 h and within 24 h;
+- median detection delay;
+- false alarms per 1,000 node-days on clean data;
+- ROC curve over the CUSUM threshold.
 
-**Firmware.** Read the PZEM at 1 Hz. Build the record `{witness_id, seq, t, V, I, P, E, tamper, nonce, prev, sig}`. Sign it with Ed25519: libsodium as an ESP-IDF component, or Monocypher. POST to the ledger every 10 s and buffer in flash when offline. Keep the private key in NVS; flash encryption is a stretch goal.
-
-**Acceptance.**
-
-- Witness power agrees with a reference meter within ±2% at steady load.
-- The tamper switch event appears in the signed stream within 2 s.
-- The ledger verifies every witness record.
-
-### 5.3 Ledger (`ledger/`, Owner A)
-
-**Purpose.** Accept, verify and store both streams, detect divergence, and publish tamper-evident hourly roots.
-
-**Tables (Postgres).**
-
-| Table | Key columns |
-| --- | --- |
-| `devices` | `device_id`, `uuid`, `serial`, `agent_pubkey`, `attest_ref`, `lease_id`, `witness_id` |
-| `leases` | `lease_id`, `lessee_id`, `start`, `term_months`, `base_rent`, `reserve_rate`, `status` |
-| `telemetry` | `device_id`, `seq`, `t`, fields…, `prev`, `sig`, `verified` (partitioned by day) |
-| `witness` | `witness_id`, `seq`, `t`, `P`, `E`, `tamper`, `sig`, `verified` |
-| `gaps` | `device_id`, `from_seq`, `to_seq`, `reason` |
-| `alerts` | `alert_id`, `device_id`, `type`, `t_start`, `severity`, `details` |
-| `merkle_roots` | `hour`, `root`, `n_records` |
-| `gsu_monthly` | `device_id`, `month`, `gsu`, `gsu_lo`, `gsu_hi` |
-
-**Endpoints.**
-
-- `POST /v1/nonce`
-- `POST /v1/telemetry/batch`
-- `POST /v1/witness/batch`
-- `GET /v1/devices/{id}/logbook`
-- `GET /v1/alerts`
-- `GET /v1/roots/{hour}`
-
-**Divergence detector (`divergence.py`).**
-
-1. **Calibration window** (first 30 min of a lease, or a labelled run): fit `P_witness(t) ≈ α + β · Σ P_gpu(t) + ε` per server. Here α is the non-GPU baseline (CPU, fans, PSU loss) and β ≥ 1 absorbs PSU efficiency.
-2. **Online:** compute the residual `e(t) = P_witness − (α + β·ΣP_gpu)` and normalise it by the calibration σ. Run a two-sided CUSUM on the normalised residual, raising an alert when it crosses `h` (set so that the false-alarm rate on clean runs is < 1 per 24 h).
-3. **Physical consistency check:** the reported core temperature should follow reported power through a first-order thermal model `T' = (P·R_th − (T − T_amb)) / τ`, fitted per device. Fake power with real heat, or the reverse, shows up as a residual.
-4. **Alert types:** `POWER_DIVERGENCE`, `THERMAL_INCONSISTENT`, `CHAIN_BREAK`, `GAP`, `IDENTITY_CHANGE`, `WITNESS_TAMPER`, `WITNESS_SILENT`.
+**Reported honestly:** the "consistent fake" attack shows the limit of software-only checks. It is why the physical witness matters, because the PSU channel still catches it whenever the real load differs from the faked load.
 
 **Acceptance.**
 
-- On clean 8 h runs: zero false `POWER_DIVERGENCE` alerts.
-- With the spoof agent: alert raised within 60 s.
-- Every hour gets a Merkle root, and a single edited record changes it (tested).
+- ≥ 200 nodes evaluated.
+- Clean false-alarm rate ≤ 1 per 100 node-days at the chosen threshold.
+- k = 0.8 power spoof detected in > 95% of cases within 1 h.
 
-### 5.4 Wear engine (`wear/`, Owner B with Owner A for data)
+These targets are aims, and the measured numbers are what we report.
 
-**Purpose.** Turn verified telemetry into GPU Stress Units (GSU), with uncertainty bands.
+### 6.6 Wear engine (`wear/`, Owner B with Owner A)
 
 **Definition.**
 
 ```
 GSU = Σ_t Δt · exp[(Ea/k)(1/T_ref − 1/T_j(t))] · (P(t)/P_ref)^n      (time at temperature and power)
-    + w_c · Σ_cycles (ΔT_i / ΔT_ref)^m                                (thermal cycling)
-    + w_m · ΔR                                                         (memory error / row-remap growth)
+    + w_c · Σ_cycles (ΔT_i / ΔT_ref)^m                                (thermal cycling, rainflow-counted)
+    + w_m · ΔR                                                         (memory error growth, where logged)
 ```
 
-- **Normalisation:** 1 GSU = 1 hour at reference conditions (`T_ref` = 70 °C junction, `P_ref` = 70% of TDP, no cycling).
-- `T_j`: use core temperature. If memory temperature is available, compute the HBM term separately and take the maximum.
-- **Thermal cycles:** apply rainflow counting (`rainflow.count_cycles`) to the 1 Hz temperature series, downsampled to 10 s and with cycles < 5 °C ignored.
-- `ΔR`: increase in corrected ECC errors plus row remaps over the period, with uncorrectable events weighted heavily.
-- **Starting values** (all in `configs/wear_params.yaml` with ranges): `Ea` 0.5–0.9 eV, `n` 1–2, `m` 1.5–2.5, plus weights. These are textbook starting points, never presented as measured facts.
+1 GSU = 1 hour at reference conditions: T_ref = 70 °C, P_ref = 70% of TDP, no cycling. Every parameter in `configs/wear_params.yaml` carries a range and a citation or the label "assumption".
 
-**Calibration (`calibrate_titan.ipynb`).**
+**Lessee profiles (`profiles.ipynb`, MIT Supercloud).**
 
-- **Data:** ORNL "GPU Lifetimes on Titan Supercomputer" (Ostrouchov et al., SC20); OSTI DOI `10.13139/ORNLNCCS/1657202`, code and data in `github.com/olcf/TitanGPULife`.
-- **Method:** fit a Cox PH model (`lifelines.CoxPHFitter`) of time-to-failure, with cabinet row/column and cage/slot/node position as covariates. The paper links these to heat dissipation and scheduling, so they serve as a thermal proxy. Translate the fitted hazard ratios across position into an implied acceleration per °C, using a stated assumption about the temperature gradient. Report how sensitive the implied `Ea` is to that assumption.
-- **Honest output:** a parameter range, not a point estimate. The pitch claim is that the ranking of two fleets by wear is stable across the range.
+- Featurise each labelled job: mean, p95 and max temperature and power; utilization statistics; cycle counts from rainflow; burstiness (spectral power at short periods).
+- Cluster the jobs (k-means / GMM, k = 3–5) and name the clusters by their dominant job types, e.g. steady large-model training vs. short bursty jobs.
+- **Output:** for each archetype, an empirical distribution of GSU per GPU-hour. The synthetic lessees in `book.py` sample from these, so the book's behaviour comes from real jobs.
 
-**Sensitivity (`sensitivity.py`).** Sobol or one-at-a-time sweeps over parameters for the two demo profiles. Output: GSU per month with p5/p50/p95 bands, and the fraction of samples in which the cycling profile wears faster than the steady one. The target is ≥ 95%.
+**Hazard calibration, two regimes.**
 
-**Acceptance.**
+1. **Summit (`calibrate_summit.ipynb`).** Time-varying Cox model of failure events (the `label`/XID hardware categories: double-bit, off-the-bus, NVLink) with covariates:
+   - rolling mean and p95 core and HBM temperature;
+   - rolling power;
+   - rainflow cycle count;
+   - node position.
 
-- A synthetic reference-condition trace gives exactly 1.00 GSU/h.
-- A constant 85 °C / 90% TDP trace gives > 1.
-- A trace cycling 30↔85 °C 20 times a day gives more GSU than a steady 75 °C trace at equal energy.
-- Unit tests cover all three.
+   Expect a weak temperature effect, consistent with the SC21 finding for this liquid-cooled, < 60 °C fleet. Report the coefficient and its confidence interval either way.
+2. **Titan (`calibrate_titan.ipynb`).** Cox model on position covariates, which the authors link to heat dissipation. The result gives a hot-regime acceleration under a stated position-to-temperature assumption.
+3. **Combine:** the published contrast between the two fleets (temperature mattered on Titan, not on Summit) becomes a regime-dependent Ea: low below ~60 °C, higher in hot, air-cooled operation. Report the range, not a single number.
 
-### 5.5 Market data pipeline (`market/`, Owner B)
+**H100/B200 baseline hazard.** Scale the baseline from the published anchors in §2.2: the Llama 3 interruption counts as an upper bound, and Delta's H100 vs. A100 memory MTBE ratio and Meta's node failure rates. The wear engine shifts hazard relative to that baseline; it does not invent absolute failure rates.
 
-**Purpose.** Supply the market component `M(a, s)` and the hedge-basis series.
-
-- **Sources:** public price pages and public APIs of Indian GPU clouds (e.g. E2E Networks, Yotta Shakti Cloud) and global ones (e.g. RunPod, Lambda, Vast.ai). Also public index values and charts published by Silicon Data and Ornn, recorded manually with their dates. Secondary-market resale prices go in a curated CSV of dated listings, entered by hand, to avoid scraping terms-of-service issues.
-- **Rules:** respect each site's robots.txt and terms. Cache raw HTML/JSON with timestamps for reproducibility. One module per provider, so a broken site does not stop the run.
-- **Normalisation:** USD per GPU-hour, SKU (A100-40/80, H100 PCIe/SXM, H200, B200…), commitment (on-demand / 1-month / 1-year), region. INR converts at the RBI reference rate of the day, stored with the record.
-- **Index:** the Chirayu India rental index per SKU and day is the volume-unweighted median of on-demand offers. `basis(t) = India_index(t) − US_index(t)` uses whatever public US points exist.
-- **Schedule:** a GitHub Actions cron runs daily (`scrape.yml`) and commits Parquet snapshots to a `data/market/` branch.
-
-**Acceptance.** At least 5 providers scraped daily for ≥ 14 consecutive days before the finale, with a chart of the India curve vs. available US points.
-
-### 5.6 Risk engine (`risk/`, Owner B)
-
-All functions are pure and vectorised over GPUs and paths; parameters come from `configs/risk_params.yaml`.
-
-**Residual model (`residual.py`).**
-
-- Market value by rental DCF: `M(a, s) = Σ_{k>a} E[rent_k | s] · u_k · (1 − opex_ratio) / (1+y)^{k−a}` up to the economic life. Here `u_k` is the utilisation assumption and the rent path comes from the regime model.
-- Condition factor `C(g) = exp(−λ g)`. λ is fitted by matching the curated resale CSV: the haircut versus hours reported by resellers maps to an approximate GSU-equivalent.
-- Failure probability by lease end, `p_f(g_T)`, from the hazard model `h(t) = h0(t)·exp(βᵀx)` with x = monthly GSU rate.
-- Expected residual: `E[V_T] = M_T · C(g_T) · (1 − p_f) + p_f · S`, where S is salvage value.
-
-**Pricing (`pricing.py`, `reserves.py`).**
-
-- Reserve rate `r = −(1/(1+y)^T) · ∂E[V_T]/∂g`, by central finite difference.
-- Base rent B solves `K = Σ_m (B + r·E[GSU_m])/(1+y)^m + E[V_T]/(1+y)^T`, using `scipy.optimize.brentq`.
-- Indexed variant: `B_m = B · I_m / I_0`.
-- **Outputs per lease:** B, r, effective monthly rent for the lessee's expected profile, and the flat worst-case rent (`g` at the p95 profile, r = 0) for comparison.
-
-**Monte Carlo (`montecarlo.py`).** For a book of N leases and P paths (target: N = 500, P = 20,000 in < 10 s on a laptop):
-
-1. **Market:** a 2-state Markov-switching model on log rental index (state-dependent drift and volatility), fitted to the scraped curve plus public index points. Rare downward jumps model new-generation launches.
-2. **Wear:** a monthly GSU rate per lease, drawn from the lessee profile distribution, or from metered data for the live device.
-3. **Failures:** Bernoulli per month with the hazard from (1)–(2), and replacement cost borne per the lease terms.
-4. **Lessee default:** one-factor Gaussian copula. The latent variable is `Z_i = √ρ·X + √(1−ρ)·ε_i`, where X is correlated with the market regime so that defaults cluster in bad rental markets. The PD per lessee comes from an assumed rating.
-5. **Loss:** `max(0, exposure_at_event − recovery)`. Recovery is the residual value at the event (lease end or default), less remarketing cost.
-6. **Outputs:** EL, VaR99, CVaR99 per lease and for the portfolio; the loss distribution array for tranching.
-
-**Tranching (`tranching.py`).**
-
-- Senior attachment `A_s` is the smallest value with `P(L > A_s) ≤ π_target`. `π_target` is configurable; use an illustrative level for the demo and label it illustrative.
-- Mezzanine and equity follow the same quantile logic.
-- **Value of data:** run the whole simulation twice.
-  - *With data:* λ and each device's g are known, with metered uncertainty.
-  - *Without data:* g is drawn from a wide prior covering both profiles, and the lessor cannot tell them apart.
-- **Report:** ΔA_s, and `Saving ≈ ΔA_s · N · (s_mezz − s_senior) · D`, with spreads set as labelled assumptions.
-
-**Hedging (`hedge.py`).** Compute `h* = ρ·σ_V/σ_F` on monthly changes of the lessor's rent-realisation series V (the India index) against the futures reference series F (public US index points). Report the residual variance share `1 − ρ²`. With few US points, show a bootstrap confidence interval and say the estimate is preliminary.
-
-**Insurance (`insurance.py`).** Premium is `(1+θ)·E[(G − V_T)⁺]/(1+y)^T`, from the simulated V_T distribution. Show it with and without data.
-
-**Lessee optimizer (`optimizer.py`).** Sweep power caps in steps of 25 W (via `nvidia-smi -pl` on the demo GPU for measured points; a model in between). Minimise `c_e·E(p) + r·GSU(p) − v·Throughput(p)`. Throughput is measured on a fixed benchmark (e.g. a matmul loop or a small training step) at each cap.
-
-**Synthetic book (`book.py`).**
-
-- 500 leases across three lessees:
-  - **Lessee α:** steady training, ~70 °C;
-  - **Lessee β:** bursty inference, cycling 35↔85 °C;
-  - **Lessee γ:** mixed.
-- SKU mix: H100 SXM and B200. Terms: 24/36 months. Start dates spread over 2026.
-- Lessee credit ratings are assumptions, labelled as such.
-- Seeded for reproducibility.
+**Sensitivity (`sensitivity.py`).** Sweep all parameters across their ranges. The claim we defend is that the steady and bursty profiles rank the same way across ≥ 95% of the parameter space. That claim is checkable, and it is all the pricing needs.
 
 **Acceptance.**
 
-- Pricing returns K exactly when re-discounted (round-trip test).
-- Monte Carlo EL converges: within ±2% between 20k and 100k paths.
-- Tranching reproduces a hand-checked example.
-- The value-of-data result has the expected sign, with a sanity check written in the notebook.
+- Reference trace gives 1.00 GSU/h.
+- Hotter and more-cycled traces give more GSU (unit tests).
+- Profiles notebook produces ≥ 3 archetypes with distinct GSU distributions.
+- Both calibration notebooks run end to end and print their coefficient tables.
 
-### 5.7 API and dashboard (`api/`, `web/`, shared)
+### 6.7 Market data pipeline (`market/`, Owner B)
 
-**Pages.**
+As before:
 
-1. **Book:** totals, marks, LTV, EL, VaR. A table of leases sortable by LTV, with drill-down to a device.
-2. **Lease pricer:** pick SKU, term, target yield and lessee profile. Shows B, r, effective rent, flat-lease comparison and a rent-vs-temperature chart.
-3. **Loss lab:** portfolio loss histogram, EL/VaR/CVaR, and a correlation ρ slider.
-4. **Structuring:** tranche stack with versus without data, and the funding saving in bps.
-5. **Hedge:** India vs. US series, h*, basis share.
-6. **Device logbook:** live telemetry, the witness overlay, GSU accrual, alerts, and condition report export (PDF/JSON).
-7. **Alerts:** a feed fed by the ledger.
+- Daily scrape of public GPU price pages and APIs: Indian clouds (e.g. E2E Networks, Yotta) and global ones (e.g. RunPod, Lambda, Vast.ai).
+- Manually recorded public index points from Silicon Data and Ornn, with dates.
+- A curated CSV of secondary-market listings.
+- Rules: respect robots.txt and terms; one module per provider; raw responses cached.
+- Normalise to USD per GPU-hour by SKU, term and region; INR at the RBI reference rate of the day.
+- The Chirayu India rental index is the daily median per SKU; basis is India minus US.
+- GitHub Actions cron commits Parquet snapshots daily.
 
-**API.** Read-only FastAPI over the ledger DB and the risk engine. Heavy simulations are precomputed and cached. The pricer runs live (< 1 s).
+**Acceptance.** ≥ 5 providers scraped daily for ≥ 14 consecutive days before the finale.
 
-**Acceptance.** All seven pages work offline from a laptop with seeded data. The live device page updates at ≥ 1 Hz.
+### 6.8 Risk engine (`risk/`, Owner B)
 
-### 5.8 Exports (shared)
+The finance core is unchanged. It is all pure, vectorised and driven by config.
 
-- **Condition report per serial:** lifetime GSU, temperature histogram, cycle counts, error history, gaps, alerts, Merkle roots covering the period, signatures.
-- **Identified-equipment record:** lessor, lessee, serial/UUID, SKU, site, witness ID, lease ID and dates. This matches the "identified equipment" framing of IFSCA's GPU leasing notification. Confirm the field list with mentors.
+- **Residual model:**
+  - `M(a, s)` by rental DCF on the regime-switching rental path.
+  - `C(g) = e^(−λg)`, with λ from reseller haircut vs. hours, mapped to GSU through the profile archetypes.
+  - Failure probability `p_f(g)` from the calibrated hazard on the H100 baseline.
+  - `E[V_T] = M_T·C(g_T)·(1 − p_f) + p_f·S`.
+- **Pricing:**
+  - Reserve rate `r = −(1/(1+y)^T)·∂E[V_T]/∂g`.
+  - Base rent B solves `K = Σ(B + r·E[GSU_m])/(1+y)^m + E[V_T]/(1+y)^T`.
+  - Indexed variant `B_m = B·I_m/I_0`.
+  - Output: B, r, effective rent per profile, and the flat worst-case comparison.
+- **Monte Carlo:** 500 leases × 20,000 paths in under 10 s.
+  - 2-state Markov-switching log rental index with launch jumps.
+  - Wear drawn from the archetype distributions.
+  - Failures from the hazard.
+  - Lessee default through a one-factor Gaussian copula linked to the market regime.
+  - Outputs: EL, VaR99, CVaR99 and the full loss array.
+- **Tranching:** quantile attachment points for a configurable, labelled-illustrative target exceedance probability.
+  - **Value of data:** the same simulation with per-device GSU known vs. drawn from a wide prior.
+  - `Saving ≈ ΔA_s·N·(s_mezz − s_senior)·D`.
+- **Hedge:** minimum-variance `h* = ρσ_V/σ_F` of the India curve against public US index points, and basis share `1 − ρ²`, with a bootstrap interval. It is labelled preliminary when US points are sparse.
+- **Insurance:** premium = `(1+θ)·E[(G − V_T)⁺]/(1+y)^T`, with and without data.
+- **Lessee optimizer:** minimise `c_e·E(p) + r·GSU(p) − v·Throughput(p)` over power cap p. Our GSU model supplies the wear side.
+  - The effect of caps on GPU power and temperature comes from published power-capping results on MIT Supercloud V100s (Zhao et al., "Sustainable Supercomputing for AI: GPU Power Capping at HPC Scale").
+  - The throughput penalty per cap level is taken from figures reported in the cited power-capping literature. Where no figure fits, it is a labelled assumption with a range.
+- **Book:** 500 leases, three lessees mapped to archetypes, H100/B200 mix, 24/36-month terms, seeded.
+
+**Acceptance.**
+
+- Pricing round-trip returns K.
+- MC expected loss within ±2% between 20k and 100k paths.
+- Tranching matches a hand-checked case.
+- Value of data has the expected sign, with a written sanity check.
+
+### 6.9 Dashboard and exports (shared)
+
+**Pages:**
+
+1. Book
+2. Lease pricer
+3. Loss lab
+4. Structuring
+5. Hedge
+6. Device logbook: replayed Summit GPU with the witness overlay and live alerts
+7. Tamper evaluation: ROC curves, false-alarm and delay tables from §6.5
+
+**Exports:** a condition report per device, and the identified-equipment record (lessor, lessee, device ID, SKU, site, witness ID, lease ID and dates). Confirm the field list with mentors.
+
+**Acceptance.** All pages work offline from one laptop with seeded data. Replay drives the logbook at ≥ 1 Hz.
 
 ---
 
-## 6. Data contracts
+## 7. Data contracts
 
-| Contract | Producer → consumer | Format | Versioned by |
-| --- | --- | --- | --- |
-| Telemetry record | agent → ledger | canonical JSON (§5.1) | `v` field |
-| Witness record | witness → ledger | canonical JSON (§5.2) | `v` field |
-| Monthly GSU | wear → risk | Parquet: `device_id, month, gsu, gsu_lo, gsu_hi` | schema file in `wear/` |
-| Market series | market → risk | Parquet: `date, sku, provider, term, region, usd_per_gpu_hr` | schema file in `market/` |
-| Risk outputs | risk → api | Parquet / JSON per run, with `run_id`, config hash, seed | `run_id` |
+| Contract | Producer → consumer | Format |
+| --- | --- | --- |
+| Telemetry record | agent → ledger | canonical JSON (§6.2), versioned by `v` |
+| Witness record | witness → ledger | canonical JSON, own key |
+| Reduced datasets | `data/` → everyone | Parquet with a schema file and data card |
+| Profile archetypes | wear → risk | Parquet: `archetype, gsu_per_hr` samples |
+| Hazard parameters | wear → risk | YAML with coefficients, CIs, source |
+| Monthly GSU | wear → risk | Parquet: `device_id, month, gsu, gsu_lo, gsu_hi` |
+| Market series | market → risk | Parquet: `date, sku, provider, term, region, usd_per_gpu_hr` |
+| Risk outputs | risk → api | Parquet/JSON with `run_id`, config hash, seed |
 
-Every risk run stores its config hash and random seed, so every number on a slide can be regenerated.
+Every number on a slide traces to a `run_id`, a config hash and the datasets or papers it came from.
 
 ---
 
-## 7. Milestones and timeline
+## 8. Milestones and timeline
 
-| Milestone | Dates | Owner A (data and trust) | Owner B (finance) | Shared / exit criteria |
+| Milestone | Dates | Owner A (data and trust) | Owner B (finance) | Exit criteria |
 | --- | --- | --- | --- | --- |
-| **M0 Foundation** | 26–30 Nov | Repo scaffolding, CI. Meter v0 sampling + chain + signatures on one GPU (IITGN cluster or a rented GPU). Two 2-hour traces: steady training run, bursty inference run | GSU v0 on both traces. `residual.py` + `pricing.py` v0 in a notebook. Scraper v0 for 3 providers | **30 Nov:** live meter screenshot, two traces with different GSU, rate card for both profiles, mentor questions (§12) |
-| **M1 Trust + simulation** | 1–7 Dec | Ledger with verification, nonces, gaps, Merkle roots. Witness fallback (smart plug + signed bridge) live. Divergence detector v1 | Synthetic book generator. Monte Carlo v1 (market regimes + wear + failures; default added at end of week). Scraper to 5+ providers, cron on | **4 Dec:** spoof agent caught by witness on a real GPU. Monte Carlo EL on 500 leases |
-| **M2 Finance depth** | 8–14 Dec | Attestation binding on a CC-capable H100 (or documented fallback). Thermal consistency check. PZEM witness hardware if lab support exists | Tranching + value of data. Hedge ratio + basis. Titan calibration notebook. Sensitivity bands. Insurance premium | Value-of-data number computed and sanity-checked. Calibration range documented |
-| **M3 Product** | 15–19 Dec | Condition report + equipment record export. Lessee power-cap measurements on demo GPU | Optimizer. Cache all heavy runs. Final parameters frozen | Dashboard: all 7 pages. Demo script runs end-to-end twice without intervention. **Feature freeze 19 Dec** |
-| **M4 Rehearsal** | 20–21 Dec | Backup videos of live moments 2 and 4 | Backup video of moments 1 and 3; slide figures from notebooks | Two timed full rehearsals; Q&A drill on §11 risks |
-| **Finale** | 22 Dec | Runs the live GPU + witness | Runs the dashboard + numbers | — |
+| **M0 Data foundation** | 26–30 Nov | Fetch scripts; reduced Summit extract (≥ 200 nodes × 1 month) and MIT Supercloud labelled subset; profiling notebooks; replay backend; chain + signatures | GSU v0 on real Supercloud traces; first archetype clustering; `residual.py` + `pricing.py` v0; scraper v0 (3 providers) | **30 Nov:** rate card for two real-trace profiles; one Summit node replayed through the signed chain; mentor questions |
+| **M1 Detection + simulation** | 1–7 Dec | Ledger; witness stream from PSU power; divergence detector; attack injector; first ROC on 50 nodes | Synthetic book from archetypes; Monte Carlo v1; scraper to 5+ providers with cron | **4 Dec:** k = 0.8 spoof caught on real data; EL on 500 leases |
+| **M2 Evidence depth** | 8–14 Dec | Thermal-consistency detector; full evaluation on ≥ 200 nodes; false-alarm tuning | Summit and Titan hazard notebooks; regime-dependent Ea; H100 baseline from §2.2; tranching + value of data; hedge; insurance; sensitivity | Value-of-data number computed; evaluation tables final; parameter table with citations |
+| **M3 Product** | 15–19 Dec | Device logbook replay page; tamper evaluation page; exports | Optimizer from published power-cap results; cache heavy runs; freeze parameters | All 7 pages; demo script end to end twice; **feature freeze 19 Dec** |
+| **M4 Rehearsal** | 20–21 Dec | Backup videos (moments 3–4) | Backup videos (moments 1–2); slide figures | Two timed rehearsals; Q&A drill on §12 |
+| **Finale** | 22 Dec | Runs replay + detection | Runs dashboard + numbers | — |
 
-**Daily rhythm:** a 10-minute sync at a fixed time, with one line each on done / next / blocked. Merge to `main` only through PRs with green CI.
+**Daily rhythm:** a 10-minute sync with one line each on done / next / blocked. Merge to `main` only through PRs with green CI.
 
 ---
 
-## 8. Infrastructure and access
+## 9. Infrastructure and access
 
 | Need | Plan | Fallback |
 | --- | --- | --- |
-| A real datacenter GPU for metering | IITGN GPU cluster (ask the admin for NVML access on one node) | Rent 1× H100 by the hour on a GPU cloud for the 2-hour trace runs and the finale demo |
-| A confidential-computing H100 for attestation | A cloud CC VM for a few hours in M2 | Bind to UUID + serial + VBIOS; state the limitation |
-| A GPU on the finale stage | Laptop / desktop GPU (consumer cards expose most NVML fields) under the witness | Pre-recorded video of the tamper catch |
-| Witness hardware | Metering smart plug + bridge (M1); PZEM + ESP32 (M2, with lab help) | Smart plug only |
-| Hosting | Everything runs locally on a laptop (Docker Compose: Postgres, ledger, api, web) | SQLite mode, no Docker |
-
-**Budget estimate (to confirm):** a few hours of rented H100 time, one metering smart plug, one ESP32 + PZEM-004T + CT, an enclosure. All of it is small next to the prize, but get the GPU hours approved early.
+| Summit telemetry | Stream ClusterWise from Hugging Face; filter on Kaggle/Colab CPU | OLCF Dataset A (58 or 100 hosts, 10 s) via Globus |
+| MIT Supercloud traces | Labelled subset from the public S3 bucket | Labelled data packaged for the MIT workload challenge |
+| Titan lifetimes | GitHub `olcf/TitanGPULife` | OSTI DOI page |
+| Storage | Reduced Parquet extracts < 5 GB on a shared drive; only small samples committed | — |
+| Demo machine | One laptop running everything (Docker Compose or plain Python) | Backup videos + screenshot deck |
+| Budget | ₹0 required; optional smart plug ₹2–3k for the stage prop | — |
 
 ---
 
-## 9. Testing and validation
+## 10. Testing and validation
 
 | Level | What | Tool |
 | --- | --- | --- |
 | Unit | Canonical JSON, signatures, chain, Merkle; GSU reference cases; pricing round-trip; tranching example | `pytest` |
-| Property | Chain verification fails for any single-field mutation; GSU monotonic in temperature and in cycle amplitude | `hypothesis` |
-| Integration | Agent → ledger → wear → risk on a recorded 2-hour trace; outputs match golden files | `pytest` + fixtures |
-| Adversarial | Spoof agent; dropped batches; replayed batch; changed serial; witness unplugged; witness lid opened | scripted scenarios in `tests/adversarial/` |
-| Statistical | MC convergence; false-alarm rate of CUSUM on clean runs; sensitivity ranking stability ≥ 95% | notebooks with asserted thresholds |
-| Demo | Full demo script on a clean machine, twice | checklist in `docs/demo.md` |
+| Property | Any single-field mutation breaks verification; GSU monotonic in temperature and cycle amplitude | `hypothesis` |
+| Integration | Replay → agent → ledger → wear → risk on a fixed 24 h Summit slice; outputs match golden files | `pytest` + fixtures |
+| Detection evaluation | §6.5 on held-out nodes (calibrate on one set of nodes, evaluate on another) | `eval/tamper_eval.py` |
+| Statistical | MC convergence; sensitivity ranking stability; hazard model CIs and proportional-hazards checks | notebooks with asserted thresholds |
+| Demo | Full script on a clean machine, twice | checklist in `docs/demo.md` |
 
 ---
 
-## 10. Finale demo script (target: 7 minutes of demo inside the pitch)
+## 11. Finale demo script (about 7 minutes inside the pitch)
 
-1. **The book (90 s).** Dashboard → Book page: 500 leases, three lessees, marks, LTV, EL, VaR. One sentence: "This is the lessor's whole risk on one screen."
-2. **Price a lease live (90 s).** Lease pricer with the same GPU-hours. Steady profile gives rent X; cycling profile gives rent Y; the flat worst-case lease gives rent Z (> X). "Careful lessees pay less; the lessor is still covered."
-3. **What the data is worth (90 s).** Structuring page, with versus without condition data: senior tranche grows by ΔA_s, saving ≈ N bps. "This is what trust is worth, in basis points."
+1. **The book (90 s).** 500 leases whose lessees behave like real deep-learning jobs (MIT Supercloud archetypes). Marks, LTV, EL, VaR on one screen.
+2. **Price a lease live (90 s).** Same GPU-hours, two real archetypes, two rents, plus the flat worst-case lease. "Careful lessees pay less; the lessor is still covered."
+3. **What the data is worth (90 s).** Tranches with vs. without condition data, giving the funding saving in basis points.
 4. **Why you can believe it (2 min).**
-   - Device logbook on the real GPU under the witness: live telemetry with the witness overlay.
-   - Switch to the spoof agent. Within 60 s, `POWER_DIVERGENCE` fires, the device's mark is flagged, and its data is excluded from pricing until resolved.
-   - Close: "The lessee controls the server. It does not control the meter."
+   - Replay a real Summit node: GPU-reported power and temperature with the independent PSU input power overlaid.
+   - Inject a 20% power under-report live; `POWER_DIVERGENCE` fires and the mark is flagged.
+   - Cut to the evaluation page: the same check across 200+ real nodes, with detection rate, false alarms per node-day and the ROC.
+   - Close: "The lessee controls the server. It does not control the power supply."
 
-Backups: a pre-recorded video for every moment, and a static screenshot deck if the laptop fails.
+**Lines to have ready:**
+
+- "Why no live GPU?" → "We validated on real data from 27,756-GPU Summit instead of one GPU on a table. The agent's NVML backend is built and goes live at the pilot."
+- "Isn't V100 data old?" → "The detection logic is about physics: power in equals heat out. Failure baselines for H100 come from published H100 studies."
 
 ---
 
-## 11. Risks and mitigations
+## 12. Risks and mitigations
 
 | Risk | Likelihood | Impact | Mitigation |
 | --- | --- | --- | --- |
-| No access to a datacenter GPU in time | Medium | High | Book rented H100 hours in M0; consumer GPU for the stage demo |
-| Attestation on CC hardware too slow to set up | High | Medium | Documented fallback binding; claim downgraded explicitly |
-| PZEM/mains wiring not safe without lab help | Medium | Low | Smart-plug witness is the default; PZEM is a stretch |
-| Too few public US index points for a credible hedge ratio | High | Medium | Present the hedge as method + preliminary estimate with CI; India curve is our own data |
-| Wear parameters challenged by a juror | High | Medium | Ranges, sensitivity, Titan calibration notebook, ranking-stability claim only |
-| "Synthetic book" challenged | Certain | Medium | Say it first; ask the jury for a pilot lessor |
-| Scrapers break on site changes | Medium | Low | One module per provider; raw cache; ≥ 5 providers |
-| Scope creep | High | High | Feature freeze 19 Dec; anything not in §1.1 waits for after the finale |
-| Demo-day hardware or network failure | Medium | High | Everything local; backup videos; screenshot deck |
+| Dataset size or download friction (240 GB / multi-TB) | Medium | High | Stream only needed columns; small node sample; start the downloads on day 1 |
+| Summit PSU power includes non-GPU load and has an ~11% offset vs. switchboard | Certain | Medium | Regression with offset and gain; CPU power as a covariate; evaluate on residuals, not raw equality |
+| Weak temperature effect on Summit makes thermal wear look small | High | Medium | That is the published finding, so present it: wear is regime-dependent; Titan anchors the hot regime; pricing only needs the ranking |
+| V100/K20X data vs. H100/B200 leases | Certain | Medium | Use old fleets only for relative effects and detection; absolute H100 rates from Delta, Meta and Llama 3 |
+| "No live hardware" challenged | High | Medium | Real fleet validation is the stronger evidence; optional smart-plug prop; NVML backend shown in code |
+| Too few public US index points for the hedge | High | Low | Present as method + preliminary estimate with a confidence interval |
+| "Synthetic book" challenged | Certain | Medium | Say it first; profiles are real; ask the jury for a pilot lessor |
+| Scope creep | High | High | Feature freeze 19 Dec |
+| Demo-day failure | Medium | High | Everything local; backup videos; screenshot deck |
 
 ---
 
-## 12. Open questions for mentors (30 Nov)
+## 13. Open questions for mentors (30 Nov)
 
-1. Would a GIFT lessor or IFSC Banking Unit accept a per-stress-unit reserve in an operating lease, or prefer a fixed reserve with a condition-based true-up at return?
+1. Would a GIFT lessor or IFSC Banking Unit accept a per-stress-unit reserve, or prefer a fixed reserve with a condition-based true-up at return?
 2. Which fields should an "identified equipment" record carry for IFSCA's GPU leasing framework?
-3. Would Chirayu as a service to lessors fall under IFSCA's TechFin and Ancillary Services regulations, or need nothing at this stage?
-4. Is there a lessor, IBU or insurer in the GIFT ecosystem willing to look at a pilot after the finale?
-5. For the tranching analysis, which target exceedance probabilities and spread assumptions would a GIFT banker find credible?
-6. Does anyone in their network know of an existing per-use GPU wear pricing product? (This tests the novelty claim.)
+3. Would Chirayu as a service to lessors fall under IFSCA's TechFin and Ancillary Services regulations?
+4. Is any lessor, IBU or insurer in the GIFT ecosystem open to a pilot with real GPUs after the finale? This also answers the "no live hardware" gap.
+5. Which target exceedance probabilities and spread assumptions would a GIFT banker find credible for the tranching analysis?
+6. Does anyone know of an existing per-use GPU wear pricing product? (This tests the novelty claim.)
+7. Can IITGN or GIFT arrange even a few hours on a datacenter GPU before 19 Dec? If yes, it adds a live NVML run as a bonus; it is not required.
 
 ---
 
-## 13. Definition of done (finale)
+## 14. Definition of done (finale)
 
-- [ ] All four demo moments run live from one laptop, twice in a row, with no manual fixes
-- [ ] Every number shown traces to a `run_id` with config hash and seed
-- [ ] Tamper catch fires within 60 s; zero false alarms in the final 8-hour clean run
-- [ ] Wear parameters, ranges and Titan calibration documented in `wear/`
-- [ ] ≥ 14 days of daily market data in the repo
-- [ ] README explains what is real, what is synthetic and what is assumed
+- [ ] All four demo moments run from one laptop, twice in a row, with no manual fixes
+- [ ] Tamper evaluation on ≥ 200 real Summit nodes, with detection rate, delay, false alarms and ROC reported
+- [ ] Lessee archetypes built from MIT Supercloud traces; GSU distributions per archetype
+- [ ] Summit and Titan hazard notebooks run end to end; parameter table with a citation per value
+- [ ] Every number shown traces to a `run_id`, config hash and source dataset or paper
+- [ ] ≥ 14 days of daily market data
+- [ ] README states what is real data, what is published results, what is synthetic and what is assumed
 - [ ] Backup videos and screenshot deck on two devices
 
 ---
 
-## 14. After the finale
+## 15. After the finale
 
-Pilot with one lessor and one Indian GPU cloud on 8–64 GPUs. Then publish the GSU spec as an open standard, with the agent open source and the pricing engine proprietary. Further out: an encumbrance registry keyed to GPU hardware identity, to stop the same GPUs being pledged twice. Planning detail lives outside this repo.
+Pilot with one lessor and one Indian GPU cloud on 8–64 GPUs: the NVML backend live, a physical witness and attestation binding. Then publish the GSU spec as an open standard, with the agent open source and the pricing engine proprietary. Further out: an encumbrance registry keyed to GPU hardware identity.
+
+---
+
+## References
+
+1. Shin, W., Oles, V., Karimi, A. M., Ellis, J. A., Wang, F. "Revealing Power, Energy and Thermal Dynamics of a 200PF Pre-Exascale Supercomputer." SC21. https://www.osti.gov/servlets/purl/1833956
+2. Shin, W. et al. "Long Term Per-Component Power and Thermal Measurements of the OLCF Summit System." Dataset, DOI 10.13139/OLCF/1861393. Companion code: https://github.com/at-aaims/summit_power_and_thermal_data
+3. ClusterWise (Summit-derived dataset), CC BY 4.0. https://huggingface.co/datasets/MachaParfait/ClusterWise
+4. Samsi, S. et al. "The MIT Supercloud Dataset." IEEE HPEC 2021. https://arxiv.org/abs/2108.02037. Data: https://dcc.mit.edu/data
+5. Ostrouchov, G. et al. "GPU Lifetimes on Titan Supercomputer: Survival Analysis and Reliability." SC20. Data: DOI 10.13139/ORNLNCCS/1657202; https://github.com/olcf/TitanGPULife
+6. Cui, S. et al. "Characterizing GPU Resilience and Impact on AI/HPC Systems" (also titled "Story of Two GPUs"). arXiv 2503.11901. https://arxiv.org/abs/2503.11901
+7. Kokolis, A. et al. "Revisiting Reliability in Large-Scale Machine Learning Research Clusters." HPCA 2025. https://arxiv.org/abs/2410.21680
+8. Zhao, D. et al. "Sustainable Supercomputing for AI: GPU Power Capping at HPC Scale." arXiv 2402.18593. https://arxiv.org/abs/2402.18593
+9. Meta Llama 3 training reliability figures, as reported by Tom's Hardware. https://www.tomshardware.com/pc-components/gpus/datacenter-gpu-service-life-can-be-surprisingly-short-only-one-to-three-years-is-expected-according-to-unnamed-google-architect
+10. Silicon Data, "The Illusion of Stability: Unpacking H100 GPU Market Value Trends." https://www.silicondata.com/use-cases/h100-gpu-market-value-trends
